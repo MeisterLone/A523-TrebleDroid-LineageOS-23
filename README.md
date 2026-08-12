@@ -674,15 +674,11 @@ The final signed image is distributed as a gzip archive:
 > **Warning:** flashing this image while the stock first-stage `system` entry still enables dm-verity is a
 > guaranteed bootloop. The GSI cannot match the stock `vbmeta_system` hashtree digest.
 
-For our C10 firmware, unpack the active `vendor_boot` and inspect
-`first_stage_ramdisk/fstab.sun55iw3p1`. If either the EROFS or ext4 `system` line contains
-`avb=vbmeta,avb_keys=/avb`, dm-verity will reject the GSI. Our fix was to remove those two AVB arguments from both
-`system` lines, then repack `vendor_boot` unchanged otherwise. If `product_a` is deleted to make room, its mandatory
-fstab line must also be removed. The stock `vendor_boot` for which this was verified has SHA-256
-`95dc7e6cb526f3084fe83e8ce9cf5ca06136729513395279bf9f87564150f5dd`.
+Follow [Checking and disabling dm-verity on the FancyDay C10](DM_VERITY.md) before flashing. The guide begins with a
+read-only runtime and `vendor_boot` inspection, provides an explicit write/no-write decision table, and keeps the
+persistent modification commands in a separately gated section.
 
-Do **not** work around this by flashing a verification-disabled vbmeta. Keep the original vbmeta partitions and verify
-the rebuilt first-stage fstab before flashing `system`.
+Do **not** work around this by flashing a verification-disabled vbmeta. Keep the original vbmeta partitions untouched.
 
 ## Source repositories and integration model
 
