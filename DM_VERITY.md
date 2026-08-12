@@ -107,11 +107,19 @@ different hash is acceptable if the image unpacks correctly and its own first-st
 
 ## 4. Unpack vendor_boot without modifying it
 
+`UNPACK` and `MKBOOT` below are variables pointing to the two Python tools in the AOSP `mkbootimg` repository cloned
+under Requirements. This assumes `mkbootimg/` is in the current directory.
+
 ```bash
-UNPACK="$PWD/mkbootimg/unpack_bootimg.py"
-MKBOOT="$PWD/mkbootimg/mkbootimg.py"
+MKBOOTIMG_DIR=$(realpath ./mkbootimg)
+UNPACK="$MKBOOTIMG_DIR/unpack_bootimg.py"
+MKBOOT="$MKBOOTIMG_DIR/mkbootimg.py"
 IN="$PWD/vendor_boot.stock.img"
 WORK=$(mktemp -d -p "$PWD" vendor_boot_check.XXXXXX)
+
+test -f "$UNPACK"
+test -f "$MKBOOT"
+test -f "$IN"
 
 mkdir -p "$WORK/out" "$WORK/root"
 python3 "$UNPACK" --boot_img "$IN" --out "$WORK/out"
