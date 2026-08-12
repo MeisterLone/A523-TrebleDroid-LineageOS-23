@@ -116,6 +116,7 @@ UNPACK="$MKBOOTIMG_DIR/unpack_bootimg.py"
 MKBOOT="$MKBOOTIMG_DIR/mkbootimg.py"
 IN="$PWD/vendor_boot.stock.img"
 WORK=$(mktemp -d -p "$PWD" vendor_boot_check.XXXXXX)
+printf 'Working directory: %s\n' "$WORK"
 
 test -f "$UNPACK"
 test -f "$MKBOOT"
@@ -124,6 +125,11 @@ test -f "$IN"
 mkdir -p "$WORK/out" "$WORK/root"
 python3 "$UNPACK" --boot_img "$IN" --out "$WORK/out"
 ```
+
+`WORK` now contains the absolute path of the newly created temporary directory on the host. All unpacked files,
+modified files, rebuilt archives, and verification output in the remaining commands are kept beneath that directory.
+Keep using the same terminal so the variable remains defined. If the shell is closed, rerun this step to create and
+populate a new working directory rather than guessing its generated name.
 
 The C10 vendor ramdisk is an LZ4-legacy fragment named `vendor_ramdisk00`:
 
