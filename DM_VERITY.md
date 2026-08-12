@@ -21,16 +21,29 @@ first-stage `system` fstab entry enables dm-verity.
 ## Requirements
 
 - A Linux host with `adb`, Python 3, `lz4`, GNU `cpio`, and Git.
-- Rooted ADB (`adb root`) or equivalent root through `su`.
+- Rooted adbd (`adb root`). The pasteable commands below assume `adb shell` is already uid 0.
 - A known recovery route such as FEL or a working recovery/fastbootd path.
 - AOSP's [`mkbootimg`](https://android.googlesource.com/platform/system/tools/mkbootimg) tools.
 
-Install the host tools and obtain `unpack_bootimg.py`/`mkbootimg.py` if needed:
+On Debian or Ubuntu, install the host tools and obtain `unpack_bootimg.py`/`mkbootimg.py` as follows. Other Linux
+distributions should install the equivalent packages through their own package manager.
 
 ```bash
-sudo apt install git python3 lz4 cpio
-git clone https://android.googlesource.com/platform/system/tools/mkbootimg
+sudo apt update
+sudo apt install -y adb git python3 lz4 cpio
+
+if [ -e mkbootimg ] && [ ! -d mkbootimg/.git ]; then
+  echo 'ERROR: ./mkbootimg exists but is not the expected Git checkout'
+  exit 1
+fi
+
+test -d mkbootimg/.git || \
+  git clone https://android.googlesource.com/platform/system/tools/mkbootimg
 ```
+
+If only an interactive `su` implementation is available, adapt and test each on-device command separately. In
+particular, do not stream a binary partition through an untested `su` wrapper because prompts or diagnostics can
+corrupt stdout.
 
 ---
 
@@ -39,7 +52,21 @@ git clone https://android.googlesource.com/platform/system/tools/mkbootimg
 Everything in Part I reads device state or copies data to the host. It does **not** write to `vendor_boot`, vbmeta,
 or any other boot partition.
 
-## 1. Confirm root and identify the active slot
+## 1. Confirm the target, root, and active slot
+
+List connected devices first:
+
+```bash
+adb devices -l
+```
+
+If more than one device is listed, select the intended tablet before running any command below:
+
+```bash
+export ANDROID_SERIAL='<serial-or-ip:port-from-adb-devices>'
+```
+
+Do not continue while the target is ambiguous. Then confirm rooted adbd and identify the active slot:
 
 ```bash
 adb root
@@ -47,17 +74,27 @@ adb wait-for-device
 adb shell id
 
 SLOT=$(adb shell getprop ro.boot.slot_suffix | tr -d '\r')
+case "$SLOT" in
+  _a|_b) ;;
+  *) echo "ERROR: unexpected slot suffix: '$SLOT'"; exit 1 ;;
+esac
 printf 'Active slot: %s\n' "$SLOT"
 ```
 
-Expected slot values are `_a` or `_b`. Stop if the value is empty or unexpected.
-
-If adbd cannot run as root but `su` works, run the on-device inspection commands through `adb shell su -c` instead.
+The explicit gate prevents an empty slot value from silently turning `vendor_boot${SLOT}` into the wrong partition
+name.
 
 ## 2. Inspect the active system device-mapper table
 
 ```bash
+adb shell 'command -v dmctl'
 adb shell "dmctl table system${SLOT}"
+```
+
+If the expected table name is absent, list the available mappings before making a decision:
+
+```bash
+adb shell 'dmctl list devices'
 ```
 
 Example without dm-verity:
@@ -85,13 +122,21 @@ device or modify the partition.
 
 ```bash
 PART="/dev/block/by-name/vendor_boot${SLOT}"
-PART_BYTES=$(adb shell "blockdev --getsize64 '$PART'" | tr -d '\r')
+adb shell "test -b '$PART'"
 
+PART_BYTES=$(adb shell "blockdev --getsize64 '$PART'" | tr -d '\r')
+case "$PART_BYTES" in
+  ''|*[!0-9]*) echo "ERROR: invalid partition size: '$PART_BYTES'"; exit 1 ;;
+esac
+test "$PART_BYTES" -gt 0
+
+test ! -e vendor_boot.stock.img
 adb exec-out "dd if='$PART' bs=4M 2>/dev/null" > vendor_boot.stock.img
 
+DUMP_BYTES=$(stat -c %s vendor_boot.stock.img)
 printf 'Partition bytes: %s\n' "$PART_BYTES"
-printf 'Dumped bytes:    %s\n' "$(stat -c %s vendor_boot.stock.img)"
-test "$(stat -c %s vendor_boot.stock.img)" = "$PART_BYTES"
+printf 'Dumped bytes:    %s\n' "$DUMP_BYTES"
+test "$DUMP_BYTES" = "$PART_BYTES"
 sha256sum vendor_boot.stock.img
 ```
 
@@ -148,7 +193,7 @@ Locate and inspect the first-stage fstab:
 ```bash
 FSTAB="$WORK/root/first_stage_ramdisk/fstab.sun55iw3p1"
 test -f "$FSTAB"
-grep -nE '^(system|product)[[:space:]]' "$FSTAB"
+grep -nE '^[[:space:]]*(system|product)[[:space:]]' "$FSTAB"
 ```
 
 The problematic C10 entries looked like this in principle:
@@ -157,6 +202,19 @@ The problematic C10 entries looked like this in principle:
 system  /system  erofs  ...  first_stage_mount,logical,slotselect,avb=vbmeta,avb_keys=/avb
 system  /system  ext4   ...  first_stage_mount,logical,slotselect,avb=vbmeta,avb_keys=/avb
 ```
+
+Check separately whether the active logical product partition exists. This check is read-only:
+
+```bash
+if adb shell "test -b '/dev/block/mapper/product${SLOT}'"; then
+  echo "product${SLOT} exists — keep the product fstab entry"
+else
+  echo "product${SLOT} is absent — remove the product fstab entry only if it was deliberately deleted"
+fi
+```
+
+An absent mapper by itself does not prove that deleting the fstab line is safe; it is a prompt to confirm how that
+firmware lays out product content.
 
 ## 5. Make the write/no-write decision
 
@@ -199,7 +257,9 @@ repacking operations as root so numeric ownership and modes are preserved.
 ## 1. Preserve a second backup
 
 ```bash
-cp --reflink=auto vendor_boot.stock.img vendor_boot.stock.backup.img
+test -f vendor_boot.stock.img
+test ! -e vendor_boot.stock.backup.img
+cp -p vendor_boot.stock.img vendor_boot.stock.backup.img
 sha256sum vendor_boot.stock.img vendor_boot.stock.backup.img
 cmp vendor_boot.stock.img vendor_boot.stock.backup.img
 ```
@@ -208,56 +268,100 @@ Store the original image somewhere other than the device before proceeding.
 
 ## 2. Record the original archive order and re-extract as root
 
+First verify that the Part I variables still point to real files, then enter a root shell with those paths passed
+explicitly:
+
 ```bash
-export WORK UNPACK MKBOOT IN
-sudo --preserve-env=WORK,UNPACK,MKBOOT,IN -s
+test -n "${WORK:-}"
+test -d "$WORK"
+test -f "$WORK/ramdisk.cpio"
+test -f "$UNPACK"
+test -f "$MKBOOT"
+test -f "$IN"
+
+sudo env WORK="$WORK" UNPACK="$UNPACK" MKBOOT="$MKBOOT" IN="$IN" \
+  bash --noprofile --norc
+```
+
+The prompt is now a root Bash shell. Create a new extraction directory rather than deleting or reusing the read-only
+Part I tree:
+
+```bash
+ROOT_WRITE="$WORK/root-write"
+test ! -e "$ROOT_WRITE"
+mkdir -p "$ROOT_WRITE"
 
 cpio -it < "$WORK/ramdisk.cpio" > "$WORK/ramdisk.list"
-rm -rf "$WORK/root"
-mkdir -p "$WORK/root"
 
 (
-  cd "$WORK/root"
+  cd "$ROOT_WRITE"
   cpio -idm --no-absolute-filenames < "$WORK/ramdisk.cpio"
 )
 
-FSTAB="$WORK/root/first_stage_ramdisk/fstab.sun55iw3p1"
+FSTAB="$ROOT_WRITE/first_stage_ramdisk/fstab.sun55iw3p1"
 test -f "$FSTAB"
 cp "$FSTAB" "$WORK/fstab.before"
 ```
 
-The `rm -rf` above removes only the temporary host extraction directory created in Part I. It does not touch the
-device or the original image.
+This avoids a recursive cleanup command entirely. If `root-write` already exists, the gate stops instead of mixing
+files from an earlier run.
 
 ## 3. Remove dm-verity flags from both system entries
 
-For the verified C10 fstab, remove the exact AVB arguments:
+The verified C10 fstab has exactly two `system` entries and both carry the exact AVB argument pair. Refuse to apply
+this text substitution to a different structure:
 
 ```bash
+SYSTEM_LINES=$(grep -Ec '^[[:space:]]*system[[:space:]]' "$FSTAB" || true)
+AVB_SYSTEM_LINES=$(grep -Ec '^[[:space:]]*system[[:space:]].*avb=vbmeta,avb_keys=/avb' "$FSTAB" || true)
+
+test "$SYSTEM_LINES" = 2 || {
+  echo "ERROR: expected two system entries, found $SYSTEM_LINES"
+  exit 1
+}
+
+test "$AVB_SYSTEM_LINES" = 2 || {
+  echo "ERROR: expected the known AVB flags on both system entries, found $AVB_SYSTEM_LINES"
+  exit 1
+}
+
 sed -i 's/,avb=vbmeta,avb_keys=\/avb//g' "$FSTAB"
 ```
 
-If `product_a` was deliberately deleted from `super` to make room for the GSI, its mandatory first-stage fstab line
-must also be removed:
+Product removal is a separate decision and defaults to off. Change `REMOVE_PRODUCT` to `yes` only when `product_a`
+was deliberately deleted from `super` and product content is supplied by the GSI system image:
 
 ```bash
-sed -i '/^product[[:space:]]/d' "$FSTAB"
+REMOVE_PRODUCT=no  # Change to yes only after confirming the product-less layout.
+
+case "$REMOVE_PRODUCT" in
+  yes) sed -i '/^[[:space:]]*product[[:space:]]/d' "$FSTAB" ;;
+  no)  echo 'Keeping the product fstab entry' ;;
+  *)   echo "ERROR: REMOVE_PRODUCT must be yes or no"; exit 1 ;;
+esac
 ```
 
-Do **not** remove the product line when the logical product partition still exists and is required by that device.
+Do **not** remove the product line when the logical product partition still exists or is required by that device.
 
 Review the exact change:
 
 ```bash
 diff -u "$WORK/fstab.before" "$FSTAB" || true
-grep -nE '^(system|product)[[:space:]]' "$FSTAB"
+grep -nE '^[[:space:]]*(system|product)[[:space:]]' "$FSTAB"
 ```
 
 Hard gate: refuse to continue if either `system` entry still carries AVB/dm-verity flags.
 
 ```bash
-if grep -E '^system[[:space:]].*(avb=|avb_keys=)' "$FSTAB"; then
+test "$(grep -Ec '^[[:space:]]*system[[:space:]]' "$FSTAB" || true)" = 2
+
+if grep -E '^[[:space:]]*system[[:space:]].*(avb=|avb_keys=)' "$FSTAB"; then
   echo 'ERROR: system still enables AVB/dm-verity'
+  exit 1
+fi
+
+if [ "$REMOVE_PRODUCT" = yes ] && grep -qE '^[[:space:]]*product[[:space:]]' "$FSTAB"; then
+  echo 'ERROR: product entry was requested for removal but is still present'
   exit 1
 fi
 ```
@@ -266,13 +370,18 @@ fi
 
 ```bash
 OUT="$PWD/vendor_boot.noverity.img"
+test ! -e "$OUT"
+test -s "$WORK/ramdisk.list"
+
 MKARGS=$(python3 "$UNPACK" --boot_img "$IN" --format mkbootimg)
+test -n "$MKARGS"
 
 (
-  cd "$WORK/root"
+  cd "$ROOT_WRITE"
   cpio -o -H newc < "$WORK/ramdisk.list" > "$WORK/ramdisk.new.cpio"
 )
 
+test -s "$WORK/ramdisk.new.cpio"
 lz4 -l -f "$WORK/ramdisk.new.cpio" "$WORK/out/vendor_ramdisk00"
 
 (
@@ -280,6 +389,7 @@ lz4 -l -f "$WORK/ramdisk.new.cpio" "$WORK/out/vendor_ramdisk00"
   eval python3 "$MKBOOT" $MKARGS --vendor_boot "$OUT"
 )
 
+test -s "$OUT"
 stat -c 'Rebuilt bytes: %s' "$OUT"
 sha256sum "$OUT"
 ```
@@ -289,8 +399,10 @@ Do not flash yet.
 ## 5. Re-unpack and verify the rebuilt image
 
 ```bash
+test ! -e "$WORK/verify"
 mkdir -p "$WORK/verify/out" "$WORK/verify/root"
 python3 "$UNPACK" --boot_img "$OUT" --out "$WORK/verify/out"
+test -f "$WORK/verify/out/vendor_ramdisk00"
 
 lz4 -d -f \
   "$WORK/verify/out/vendor_ramdisk00" \
@@ -303,10 +415,17 @@ lz4 -d -f \
 
 VERIFY_FSTAB="$WORK/verify/root/first_stage_ramdisk/fstab.sun55iw3p1"
 test -f "$VERIFY_FSTAB"
-grep -nE '^(system|product)[[:space:]]' "$VERIFY_FSTAB"
+grep -nE '^[[:space:]]*(system|product)[[:space:]]' "$VERIFY_FSTAB"
 
-if grep -E '^system[[:space:]].*(avb=|avb_keys=)' "$VERIFY_FSTAB"; then
+test "$(grep -Ec '^[[:space:]]*system[[:space:]]' "$VERIFY_FSTAB" || true)" = 2
+
+if grep -E '^[[:space:]]*system[[:space:]].*(avb=|avb_keys=)' "$VERIFY_FSTAB"; then
   echo 'ERROR: rebuilt image still enables dm-verity for system'
+  exit 1
+fi
+
+if [ "$REMOVE_PRODUCT" = yes ] && grep -qE '^[[:space:]]*product[[:space:]]' "$VERIFY_FSTAB"; then
+  echo 'ERROR: rebuilt image still contains the product entry'
   exit 1
 fi
 ```
@@ -318,18 +437,34 @@ Confirm that the only intended semantic changes are:
 
 ## 6. Pad the image to the partition size
 
-Return to the non-root host shell if `sudo -s` was used:
+Leave the root Bash shell started in Step 2, returning to the original host shell:
 
 ```bash
 exit
 
 SLOT=$(adb shell getprop ro.boot.slot_suffix | tr -d '\r')
-PART="/dev/block/by-name/vendor_boot${SLOT}"
-PART_BYTES=$(adb shell "blockdev --getsize64 '$PART'" | tr -d '\r')
+case "$SLOT" in
+  _a|_b) ;;
+  *) echo "ERROR: unexpected slot suffix: '$SLOT'"; exit 1 ;;
+esac
 
+PART="/dev/block/by-name/vendor_boot${SLOT}"
+adb shell "test -b '$PART'"
+
+PART_BYTES=$(adb shell "blockdev --getsize64 '$PART'" | tr -d '\r')
+case "$PART_BYTES" in
+  ''|*[!0-9]*) echo "ERROR: invalid partition size: '$PART_BYTES'"; exit 1 ;;
+esac
+test "$PART_BYTES" -gt 0
+
+test -s vendor_boot.noverity.img
+test ! -e vendor_boot.noverity.padded.img
 cp vendor_boot.noverity.img vendor_boot.noverity.padded.img
-test "$(stat -c %s vendor_boot.noverity.padded.img)" -le "$PART_BYTES"
+
+IMAGE_BYTES=$(stat -c %s vendor_boot.noverity.padded.img)
+test "$IMAGE_BYTES" -le "$PART_BYTES"
 truncate -s "$PART_BYTES" vendor_boot.noverity.padded.img
+test "$(stat -c %s vendor_boot.noverity.padded.img)" = "$PART_BYTES"
 stat -c 'Flash image bytes: %s' vendor_boot.noverity.padded.img
 ```
 
@@ -338,10 +473,14 @@ The padded image must exactly equal the reported partition size.
 ## 7. Write vendor_boot through rooted Android
 
 ```bash
-adb push vendor_boot.noverity.padded.img /data/local/tmp/
+REMOTE_FLASH=/data/local/tmp/vendor_boot.noverity.padded.img
+adb shell "rm -f '$REMOTE_FLASH'"
+adb push vendor_boot.noverity.padded.img "$REMOTE_FLASH"
+
+adb shell "test \"\$(stat -c %s '$REMOTE_FLASH')\" = '$PART_BYTES'"
 
 adb shell "dd \
-  if=/data/local/tmp/vendor_boot.noverity.padded.img \
+  if='$REMOTE_FLASH' \
   of='$PART' \
   bs=4M"
 
@@ -350,17 +489,25 @@ adb shell sync
 
 Do not reboot yet.
 
-If adbd itself is not root, execute the `dd` and `sync` commands through `su -c`.
+These pasteable commands require rooted adbd. If `adb shell id` is no longer uid 0, stop and restore root access before
+continuing rather than improvising around the partition write.
 
 ## 8. Read the partition back and compare it before rebooting
 
 ```bash
+REMOTE_READBACK=/data/local/tmp/vendor_boot.readback.img
+test ! -e vendor_boot.readback.img
+adb shell "rm -f '$REMOTE_READBACK'"
+
 adb shell "dd \
   if='$PART' \
-  of=/data/local/tmp/vendor_boot.readback.img \
+  of='$REMOTE_READBACK' \
   bs=4M"
 
-adb pull /data/local/tmp/vendor_boot.readback.img
+adb pull "$REMOTE_READBACK" vendor_boot.readback.img
+
+test "$(stat -c %s vendor_boot.noverity.padded.img)" = "$PART_BYTES"
+test "$(stat -c %s vendor_boot.readback.img)" = "$PART_BYTES"
 
 stat -c '%s %n' \
   vendor_boot.noverity.padded.img \
@@ -385,10 +532,41 @@ adb root
 adb wait-for-device
 
 SLOT=$(adb shell getprop ro.boot.slot_suffix | tr -d '\r')
-adb shell "dmctl table system${SLOT}"
+case "$SLOT" in
+  _a|_b) ;;
+  *) echo "ERROR: unexpected slot suffix: '$SLOT'"; exit 1 ;;
+esac
+
+DM_TABLE=$(adb shell "dmctl table system${SLOT}")
+printf '%s\n' "$DM_TABLE"
+
+if grep -q 'verity' <<<"$DM_TABLE"; then
+  echo 'ERROR: system still has a verity target'
+  exit 1
+fi
+
+grep -q 'linear' <<<"$DM_TABLE"
+echo 'system uses linear targets only'
 ```
 
 Every target in the active `system` table should now be `linear`; none should say `verity`.
+
+## Validation record
+
+The complete decision, rebuild, and write/read-back command path was dry-run after publication:
+
+- Part I was executed against the live, already-corrected C10. It read the active 32 MiB `vendor_boot`, unpacked it,
+  found no AVB flags in either system entry, and correctly reached the **do not write** decision.
+- Part II was executed offline against the preserved stock `vendor_boot` with SHA-256
+  `95dc7e6cb526f3084fe83e8ce9cf5ca06136729513395279bf9f87564150f5dd`. The known AVB flags were detected,
+  patched, rebuilt, re-unpacked, and verified.
+- The padding, upload, `dd`, read-back, size checks, SHA-256 checks, and `cmp` sequence was executed against a 32 MiB
+  mock file under `/data/local/tmp`; no real boot partition was written during the dry run.
+- The final runtime check passed against the live C10 and reported only `linear` targets.
+
+The actual device modification predates this dry run and was validated by successful GSI boots. The mock target was
+used here specifically to test the published write/read-back commands without risking the working combined
+vendor_boot.
 
 ## What this change does not do
 
