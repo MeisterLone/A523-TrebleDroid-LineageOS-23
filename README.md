@@ -660,14 +660,14 @@ to distinguish proof from inference and to state when an answer is device-specif
 <a id="download-image"></a>
 ## lineage-23.2-20260812-UNOFFICIAL-arm64_bgN-signed.img
 
-The final signed image produced by this project is:
+The final signed image is distributed as a gzip archive:
 
-```text
-lineage-23.2-20260812-UNOFFICIAL-arm64_bgN-signed.img
-Size:    3,225,112,576 bytes
-SHA-256: 1ff235092605a79ac4b44e8eb8ca2cf53260c2352424cabbfbf4c43f2f4460c2
-SourceForge: https://downloads.sourceforge.net/project/a523-trebledroid-lineageos-23/lineage-23.2-20260812-UNOFFICIAL-arm64_bgN-signed.img.gz
-```
+[Download `lineage-23.2-20260812-UNOFFICIAL-arm64_bgN-signed.img.gz` from SourceForge](https://downloads.sourceforge.net/project/a523-trebledroid-lineageos-23/lineage-23.2-20260812-UNOFFICIAL-arm64_bgN-signed.img.gz)
+
+| Artifact | Size | SHA-256 |
+|---|---:|---|
+| Downloaded `.img.gz` | 1,509,033,632 bytes | `f33754dec15d9679a29cec8439aed48967ed25a5bfe60193fdc1c3fc325f7de6` |
+| Decompressed `.img` | 3,225,112,576 bytes | `1ff235092605a79ac4b44e8eb8ca2cf53260c2352424cabbfbf4c43f2f4460c2` |
 
 ### Before flashing: check dm-verity
 
