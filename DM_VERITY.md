@@ -1,24 +1,30 @@
 # Checking and disabling dm-verity on the FancyDay C10
 
-This document covers one specific boot blocker encountered on the FancyDay C10 (`sun55iw3p1`): the stock
-first-stage fstab enables dm-verity for `system`, but a GSI cannot match the stock `vbmeta_system` hashtree digest.
-Flashing a different system image without addressing that mismatch causes a bootloop before Android finishes early
-boot.
+Before flashing a GSI, you need to answer one question: **does the first-stage `system` entry still turn on
+dm-verity?**
 
-The procedure is deliberately split into two independent parts:
+On the stock FancyDay C10 firmware, it does. A GSI has a different hashtree from the stock system, so leaving that
+check enabled produces an early bootloop. The good news is that checking is safe, and most of this guide is just
+looking before touching anything.
 
-1. **Read-only diagnosis** — inspect the running device and a dumped copy of `vendor_boot`. This part does not write
-   to any boot partition.
-2. **Persistent modification** — edit and write `vendor_boot` only if the read-only evidence proves it is necessary.
+## Quick answer
 
-Do not proceed to Part II merely because the device uses AVB somewhere. The deciding question is whether the
-first-stage `system` fstab entry enables dm-verity.
+| What you find | What to do |
+|---|---|
+| `dmctl` shows only `linear`, and the first-stage system lines have no `avb=`/`avb_keys=` | You are already good. Stop after Part 1. |
+| Either first-stage system line contains the known AVB flags | Use Part 2 before flashing the GSI. |
+| The ramdisk, fstab path, or AVB layout looks different | Stop. Your firmware needs its own analysis. |
 
-> **Scope:** These paths and image details are verified on the FancyDay C10 firmware used by this project. Other
-> A523 boards may store their first-stage fstab elsewhere or use a different vendor ramdisk layout. Stop if the
-> expected files are absent; do not improvise by flashing disabled vbmeta.
+The guide is split on purpose:
 
-## Requirements
+1. **Part 1 is read-only.** It checks the live mapping and inspects a copy of `vendor_boot` on your computer.
+2. **Part 2 writes `vendor_boot`.** Go there only when Part 1 proves the change is needed.
+
+> **Device-specific note:** The paths below are verified on the FancyDay C10 (`sun55iw3p1`). Other A523 tablets may
+> arrange their ramdisk differently. If an expected file is missing, that is a stop sign—not an invitation to flash a
+> disabled vbmeta and hope for the best.
+
+## What you need
 
 - A Linux host with `adb`, Python 3, `lz4`, GNU `cpio`, and Git.
 - Rooted adbd (`adb root`). The pasteable commands below assume `adb shell` is already uid 0.
@@ -47,12 +53,12 @@ corrupt stdout.
 
 ---
 
-# Part I — Read-only, non-invasive diagnosis
+## Part 1: Check first (safe and read-only)
 
-Everything in Part I reads device state or copies data to the host. It does **not** write to `vendor_boot`, vbmeta,
+Everything in Part 1 reads device state or copies data to the host. It does **not** write to `vendor_boot`, vbmeta,
 or any other boot partition.
 
-## 1. Confirm the target, root, and active slot
+### 1. Make sure ADB is talking to the right tablet
 
 List connected devices first:
 
@@ -84,7 +90,7 @@ printf 'Active slot: %s\n' "$SLOT"
 The explicit gate prevents an empty slot value from silently turning `vendor_boot${SLOT}` into the wrong partition
 name.
 
-## 2. Inspect the active system device-mapper table
+### 2. See how `system` is mapped right now
 
 ```bash
 adb shell 'command -v dmctl'
@@ -112,13 +118,11 @@ Decision:
 | Any target is `verity` | The active `system` mapping is protected by dm-verity | The downloaded GSI will not match the stock digest; continue to the offline fstab inspection |
 | `dmctl` fails or the device name differs | Runtime result is inconclusive | Do not write anything; rely on the offline fstab inspection below |
 
-The runtime table is useful evidence, but the first-stage fstab is the authoritative configuration that will be used
-on the next boot.
+This is a useful first look. The fstab check below is the final word, because that is what early boot reads next time.
 
-## 3. Read the active vendor_boot to the host
+### 3. Copy `vendor_boot` to your computer
 
-The following streams the partition directly to a file on the Linux host. It does not create a temporary image on the
-device or modify the partition.
+This copies the active partition straight to your Linux computer. Nothing is written back to the tablet.
 
 ```bash
 PART="/dev/block/by-name/vendor_boot${SLOT}"
@@ -150,10 +154,10 @@ SHA-256: 95dc7e6cb526f3084fe83e8ce9cf5ca06136729513395279bf9f87564150f5dd
 The hash is a reference, not a patch gate. This dm-verity procedure uses no fixed partition or byte offsets. A
 different hash is acceptable if the image unpacks correctly and its own first-stage fstab is inspected.
 
-## 4. Unpack vendor_boot without modifying it
+### 4. Unpack the copy and find the real first-stage fstab
 
-`UNPACK` and `MKBOOT` below are variables pointing to the two Python tools in the AOSP `mkbootimg` repository cloned
-under Requirements. This assumes `mkbootimg/` is in the current directory.
+These variables simply point at the two AOSP tools cloned earlier. The commands expect `mkbootimg/` in your current
+directory.
 
 ```bash
 MKBOOTIMG_DIR=$(realpath ./mkbootimg)
@@ -171,10 +175,8 @@ mkdir -p "$WORK/out" "$WORK/root"
 python3 "$UNPACK" --boot_img "$IN" --out "$WORK/out"
 ```
 
-`WORK` now contains the absolute path of the newly created temporary directory on the host. All unpacked files,
-modified files, rebuilt archives, and verification output in the remaining commands are kept beneath that directory.
-Keep using the same terminal so the variable remains defined. If the shell is closed, rerun this step to create and
-populate a new working directory rather than guessing its generated name.
+`WORK` is just the temporary folder holding everything from here on. Keep this terminal open so the variable stays
+set. If you close it, rerun this step instead of guessing the generated folder name.
 
 The C10 vendor ramdisk is an LZ4-legacy fragment named `vendor_ramdisk00`:
 
@@ -213,28 +215,28 @@ else
 fi
 ```
 
-An absent mapper by itself does not prove that deleting the fstab line is safe; it is a prompt to confirm how that
-firmware lays out product content.
+An absent mapper is only a clue. Remove the product line later only if you know `product_a` was deliberately deleted
+and the GSI supplies that content itself.
 
-## 5. Make the write/no-write decision
+### 5. Decision time
 
 Use the fstab output—not the device model name—as the final decision gate.
 
-### Do not modify vendor_boot when
+#### You are done—do not change `vendor_boot`—when
 
 - neither `system` line contains `avb=` or `avb_keys=`; and
 - the runtime `system` device-mapper table contains only `linear` targets.
 
 In that state, this particular dm-verity fix is unnecessary.
 
-### Modification is required before flashing this GSI when
+#### You need Part 2 when
 
 - either first-stage `system` line contains `avb=vbmeta`, `avb_keys=/avb`, or equivalent dm-verity configuration.
 
 The GSI's ext4 data and hashtree cannot match the stock `vbmeta_system` root digest. On this firmware, leaving those
 flags enabled causes a guaranteed early bootloop.
 
-### Stop and investigate instead of writing when
+#### Stop and investigate when
 
 - `vendor_boot` does not unpack normally;
 - `vendor_ramdisk00` is absent;
@@ -242,19 +244,20 @@ flags enabled causes a guaranteed early bootloop.
 - the fstab uses a different AVB arrangement than the two known C10 `system` entries; or
 - there is no tested recovery route.
 
-A different layout is not permission to copy C10 paths blindly.
+Different layout, different job. Do not force the C10 paths onto it.
 
 ---
 
-# Part II — Persistent vendor_boot modification
+<details>
+<summary><strong>Part 2: Fix it only if Part 1 says you need to</strong></summary>
 
-> **Stop:** Part II writes an early boot partition. Continue only if Part I showed AVB/dm-verity flags on the
-> first-stage `system` entries, all backups are verified, and a recovery route is available.
+> **This is the point where writing begins.** Continue only if Part 1 found the AVB flags, your backup is good, and
+> you already know how you would restore `vendor_boot` if the tablet does not boot.
 
-The following commands assume the variables and extracted tree from Part I still exist. Run the cpio extraction and
-repacking operations as root so numeric ownership and modes are preserved.
+Keep using the same terminal from Part 1. The archive is extracted again as root so Android's original numeric owners
+and file modes survive the rebuild.
 
-## 1. Preserve a second backup
+### 1. Make one more backup
 
 ```bash
 test -f vendor_boot.stock.img
@@ -264,12 +267,11 @@ sha256sum vendor_boot.stock.img vendor_boot.stock.backup.img
 cmp vendor_boot.stock.img vendor_boot.stock.backup.img
 ```
 
-Store the original image somewhere other than the device before proceeding.
+Keep that backup somewhere off the tablet. It is your way back.
 
-## 2. Record the original archive order and re-extract as root
+### 2. Open a clean root-owned copy of the ramdisk
 
-First verify that the Part I variables still point to real files, then enter a root shell with those paths passed
-explicitly:
+Make sure the files from Part 1 are still there, then open a root shell with those paths carried across:
 
 ```bash
 test -n "${WORK:-}"
@@ -283,8 +285,7 @@ sudo env WORK="$WORK" UNPACK="$UNPACK" MKBOOT="$MKBOOT" IN="$IN" \
   bash --noprofile --norc
 ```
 
-The prompt is now a root Bash shell. Create a new extraction directory rather than deleting or reusing the read-only
-Part I tree:
+You are now in a root Bash shell. Make a fresh extraction next to the read-only one:
 
 ```bash
 ROOT_WRITE="$WORK/root-write"
@@ -303,13 +304,12 @@ test -f "$FSTAB"
 cp "$FSTAB" "$WORK/fstab.before"
 ```
 
-This avoids a recursive cleanup command entirely. If `root-write` already exists, the gate stops instead of mixing
-files from an earlier run.
+If `root-write` already exists, the command stops instead of mixing old and new files.
 
-## 3. Remove dm-verity flags from both system entries
+### 3. Remove the two dm-verity flags
 
-The verified C10 fstab has exactly two `system` entries and both carry the exact AVB argument pair. Refuse to apply
-this text substitution to a different structure:
+The C10 has exactly two `system` lines, and both carry the same AVB pair. These checks stop the edit if your file does
+not match that layout:
 
 ```bash
 SYSTEM_LINES=$(grep -Ec '^[[:space:]]*system[[:space:]]' "$FSTAB" || true)
@@ -328,8 +328,8 @@ test "$AVB_SYSTEM_LINES" = 2 || {
 sed -i 's/,avb=vbmeta,avb_keys=\/avb//g' "$FSTAB"
 ```
 
-Product removal is a separate decision and defaults to off. Change `REMOVE_PRODUCT` to `yes` only when `product_a`
-was deliberately deleted from `super` and product content is supplied by the GSI system image:
+Product is a separate choice, so the default is safely `no`. Set it to `yes` only if you deliberately deleted
+`product_a` and the GSI carries product content inside system:
 
 ```bash
 REMOVE_PRODUCT=no  # Change to yes only after confirming the product-less layout.
@@ -341,16 +341,16 @@ case "$REMOVE_PRODUCT" in
 esac
 ```
 
-Do **not** remove the product line when the logical product partition still exists or is required by that device.
+If you are unsure, leave product alone.
 
-Review the exact change:
+Now look at the exact edit:
 
 ```bash
 diff -u "$WORK/fstab.before" "$FSTAB" || true
 grep -nE '^[[:space:]]*(system|product)[[:space:]]' "$FSTAB"
 ```
 
-Hard gate: refuse to continue if either `system` entry still carries AVB/dm-verity flags.
+One last gate before rebuilding:
 
 ```bash
 test "$(grep -Ec '^[[:space:]]*system[[:space:]]' "$FSTAB" || true)" = 2
@@ -366,7 +366,7 @@ if [ "$REMOVE_PRODUCT" = yes ] && grep -qE '^[[:space:]]*product[[:space:]]' "$F
 fi
 ```
 
-## 4. Repack the vendor ramdisk and vendor_boot
+### 4. Repack `vendor_boot`
 
 ```bash
 OUT="$PWD/vendor_boot.noverity.img"
@@ -394,9 +394,9 @@ stat -c 'Rebuilt bytes: %s' "$OUT"
 sha256sum "$OUT"
 ```
 
-Do not flash yet.
+Still do not flash it. First prove the rebuilt image contains the edit.
 
-## 5. Re-unpack and verify the rebuilt image
+### 5. Unpack your rebuilt image and check it again
 
 ```bash
 test ! -e "$WORK/verify"
@@ -430,12 +430,10 @@ if [ "$REMOVE_PRODUCT" = yes ] && grep -qE '^[[:space:]]*product[[:space:]]' "$V
 fi
 ```
 
-Confirm that the only intended semantic changes are:
+At this point the only meaningful changes should be the two AVB removals, plus the product-line removal only when you
+explicitly requested it.
 
-- removal of `avb=vbmeta,avb_keys=/avb` from both `system` entries; and
-- removal of the `product` entry only when `product_a` has also been deleted.
-
-## 6. Pad the image to the partition size
+### 6. Pad the image to the real partition size
 
 Leave the root Bash shell started in Step 2, returning to the original host shell:
 
@@ -468,9 +466,9 @@ test "$(stat -c %s vendor_boot.noverity.padded.img)" = "$PART_BYTES"
 stat -c 'Flash image bytes: %s' vendor_boot.noverity.padded.img
 ```
 
-The padded image must exactly equal the reported partition size.
+The padded file should now be exactly the same size as the partition.
 
-## 7. Write vendor_boot through rooted Android
+### 7. Write it, but do not reboot yet
 
 ```bash
 REMOTE_FLASH=/data/local/tmp/vendor_boot.noverity.padded.img
@@ -487,12 +485,11 @@ adb shell "dd \
 adb shell sync
 ```
 
-Do not reboot yet.
+Do not reboot yet. Read it back first.
 
-These pasteable commands require rooted adbd. If `adb shell id` is no longer uid 0, stop and restore root access before
-continuing rather than improvising around the partition write.
+These commands expect rooted adbd. If `adb shell id` is no longer uid 0, stop and fix that before continuing.
 
-## 8. Read the partition back and compare it before rebooting
+### 8. Read it back and prove the write was exact
 
 ```bash
 REMOTE_READBACK=/data/local/tmp/vendor_boot.readback.img
@@ -521,9 +518,9 @@ cmp vendor_boot.noverity.padded.img vendor_boot.readback.img \
   && echo 'vendor_boot read-back verified'
 ```
 
-Only reboot if `cmp` succeeds.
+If `cmp` says the files differ, do not reboot. Restore the backup while Android is still running.
 
-## 9. Reboot and confirm the result
+### 9. Reboot and do one last check
 
 ```bash
 adb reboot
@@ -549,27 +546,28 @@ grep -q 'linear' <<<"$DM_TABLE"
 echo 'system uses linear targets only'
 ```
 
-Every target in the active `system` table should now be `linear`; none should say `verity`.
+That is the result you want: `linear` targets and no `verity` target.
 
-## Validation record
+<details>
+<summary><strong>How these commands were tested</strong></summary>
 
-The complete decision, rebuild, and write/read-back command path was dry-run after publication:
+The complete decision, rebuild, and write/read-back path was dry-run after publication:
 
-- Part I was executed against the live, already-corrected C10. It read the active 32 MiB `vendor_boot`, unpacked it,
-  found no AVB flags in either system entry, and correctly reached the **do not write** decision.
-- Part II was executed offline against the preserved stock `vendor_boot` with SHA-256
-  `95dc7e6cb526f3084fe83e8ce9cf5ca06136729513395279bf9f87564150f5dd`. The known AVB flags were detected,
-  patched, rebuilt, re-unpacked, and verified.
-- The padding, upload, `dd`, read-back, size checks, SHA-256 checks, and `cmp` sequence was executed against a 32 MiB
-  mock file under `/data/local/tmp`; no real boot partition was written during the dry run.
-- The final runtime check passed against the live C10 and reported only `linear` targets.
+- Part 1 ran against the live, already-corrected C10 and correctly stopped at **do not write**.
+- Part 2 ran offline against the preserved stock `vendor_boot` with SHA-256
+  `95dc7e6cb526f3084fe83e8ce9cf5ca06136729513395279bf9f87564150f5dd`.
+- Repacking, re-unpacking, padding, upload, `dd`, read-back, SHA-256, and `cmp` all passed. The write test used a
+  32 MiB mock file under `/data/local/tmp`, not the real boot partition.
+- The live C10's final table reports only `linear` targets.
 
-The actual device modification predates this dry run and was validated by successful GSI boots. The mock target was
-used here specifically to test the published write/read-back commands without risking the working combined
-vendor_boot.
+The real device change predates this dry run and has also been validated by successful GSI boots.
 
-## What this change does not do
+</details>
 
+## What this does—and does not—change
+
+- It removes dm-verity from the two first-stage `system` entries.
+- It optionally removes the product entry when you explicitly choose the product-less layout.
 - It does not modify vbmeta.
 - It does not patch U-Boot, TOC0, or the signed early boot chain.
 - It does not unlock fastbootd.
@@ -579,10 +577,12 @@ vendor_boot.
 The fixed `0x0a4d1c` offset documented elsewhere applies only to the separate fastbootd unlock patch. It is unrelated
 to this fstab modification.
 
-## Recovery
+## If it does not boot
 
-If the rebuilt image fails to boot, restore `vendor_boot.stock.img` through the previously validated FEL or recovery
-path. Never begin Part II without that recovery path and an independently stored backup.
+If the rebuilt image does not boot, restore `vendor_boot.stock.img` through the FEL or recovery path you tested
+before starting. That is exactly why the backup comes first.
 
-Do not flash a verification-disabled vbmeta as a substitute for this targeted fstab change, and do not re-lock a
-device that depends on modified boot images.
+Do not substitute a verification-disabled vbmeta for this small fstab change, and do not re-lock a device that depends
+on modified boot images.
+
+</details>
