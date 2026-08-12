@@ -666,7 +666,7 @@ The final signed image produced by this project is:
 lineage-23.2-20260812-UNOFFICIAL-arm64_bgN-signed.img
 Size:    3,225,112,576 bytes
 SHA-256: 1ff235092605a79ac4b44e8eb8ca2cf53260c2352424cabbfbf4c43f2f4460c2
-SourceForge: <link pending>
+SourceForge: https://downloads.sourceforge.net/project/a523-trebledroid-lineageos-23/lineage-23.2-20260812-UNOFFICIAL-arm64_bgN-signed.img.gz
 ```
 
 ### Before flashing: check dm-verity
